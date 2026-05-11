@@ -1,0 +1,9 @@
+{
+  "thoughts": [
+    {
+      "id": "001",
+      "text": "Migrating from Compose Multiplatform to vanilla HTML/CSS/JS. Instant load times feel like cheating. Conclusion — Compose Multiplatform is not ready for web right now, a lot of features are missing and the ecosystem is not mature enough. Also the fact that the navigation is done via window.location.href is a bit annoying for me.",
+      "date": "10 May 2026"
+    }
+  ]
+}

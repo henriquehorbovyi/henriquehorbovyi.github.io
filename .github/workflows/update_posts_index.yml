@@ -1,0 +1,40 @@
+name: Update Posts Index
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'content/posts/**/index.html'
+
+permissions:
+  contents: write
+
+jobs:
+  update-index:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Make script executable
+        run: chmod +x ./scripts/generate-posts-index.sh
+
+      - name: Generate posts index
+        run: ./scripts/generate-posts-index.sh
+        env:
+          SHOW_OUTPUT: true
+
+      - name: Commit & Push
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "Actions Bot 🤖"
+
+          git add content/posts/index.json
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "🤖 Auto-update posts index"
+            git push
+            echo "Index updated and pushed!"
+          fi

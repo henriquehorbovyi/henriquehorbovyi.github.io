@@ -1,0 +1,169 @@
+<h1>Kotlin Flow Operators: combine vs merge vs zip</h1>
+<p class="post-meta">9 May 2026</p>
+<p class="post-summary">A visual deep-dive into the three Kotlin Flow operators for combining streams — what each one does, when to use it, and the gotchas to watch for. With marble diagrams and real-world examples.</p>
+
+<p>When you start working with Kotlin Flows, you'll quickly run into situations where you want to combine values from multiple flows into one. The standard library gives you three operators for that — <code>combine</code>, <code>merge</code>, and <code>zip</code> — and they look interchangeable at first glance. They're not. Picking the wrong one is one of the most common sources of subtle reactive bugs in Android and server-side codebases alike.</p>
+<p>This post walks through what each operator does, how to visualize it, and when to reach for which.</p>
+
+<h2>A quick refresher on Flow</h2>
+
+<p>A <code>Flow&lt;T&gt;</code> is Kotlin's coroutine-friendly way of representing a stream of values produced asynchronously over time. Conceptually it's <code>Sequence&lt;T&gt;</code> plus suspending functions: it can pause, resume, and respect coroutine cancellation. You build a flow with <code>flow { emit(...) }</code>, <code>flowOf(...)</code>, or by converting from other types (<code>asFlow()</code>, <code>callbackFlow {}</code>, etc.), and you consume it from a coroutine with <code>collect { }</code>.</p>
+
+<p>Most non-trivial code involves multiple flows. A UI screen might have one <code>StateFlow</code> for the search query and another for the active filter. A repository might emit both network and cache events. Sooner or later you need to merge them — and that's where the three operators come in.</p>
+
+<p>In each marble diagram below, <strong>flow1</strong> emits numbers and <strong>flow2</strong> emits letters at different rates. Watch where the result emissions land on the timeline.</p>
+
+<hr>
+
+<h2>Zip — pair values 1-to-1</h2>
+<img src="https://raw.githubusercontent.com/henriquehorbovyi/blog/refs/heads/main/posts/kotlin-merge-combine-zip/zip.png" alt="Zip marble diagram" />
+
+<p><code>zip</code> waits for <strong>both</strong> flows to emit, then pairs the values and emits the pair (or the result of a transform). The faster flow stalls — its emissions are buffered until the slower flow catches up. The result completes as soon as the <strong>shorter</strong> of the two flows ends; any leftover values from the longer flow are dropped.</p>
+
+<pre><code>val nums = flowOf(1, 2, 3, 4).onEach { delay(100) }
+val letters = flowOf("A", "B", "C").onEach { delay(300) }
+
+nums.zip(letters) { n, l -> "$n$l" }.collect(::println)
+// Output:
+// 1A   (after ~300ms)
+// 2B   (after ~600ms)
+// 3C   (after ~900ms)
+// 4 is never emitted because letters has no fourth value</code></pre>
+
+<h3>When to use it</h3>
+<ul>
+  <li>Pairing items from two parallel sequences that match up in order: file uploads with their checksums, requests with their responses, two halves of a calculation.</li>
+  <li>Any time the <em>position</em> in each flow matters and you want strict 1-to-1 alignment.</li>
+</ul>
+
+<h3>Gotchas</h3>
+<ul>
+  <li><strong>It's almost never what you want for state.</strong> If <code>query</code> and <code>filter</code> are both <code>StateFlow</code>s representing UI state, you do <em>not</em> want <code>zip</code>. It will pair the first query with the first filter, the second with the second, and so on — even if the user only changed one of them. Use <code>combine</code> for that.</li>
+  <li><strong>The faster flow gets backpressured.</strong> zip suspends emissions while waiting for the other side, so don't use it when one of the flows is hot and expected to be lossy.</li>
+</ul>
+
+<hr>
+
+<h2>Combine — emit on every change with the latest values</h2>
+<img src="https://raw.githubusercontent.com/henriquehorbovyi/blog/refs/heads/main/posts/kotlin-merge-combine-zip/combine.png" alt="Combine marble diagram" />
+
+<p><code>combine</code> emits whenever <strong>any</strong> flow emits, using the <em>latest</em> value from each input flow. It needs every flow to have emitted at least once before it produces anything — that's why there's no result emission until both <code>1</code> and <code>A</code> have arrived in the diagram above.</p>
+
+<pre><code>val nums = flowOf(1, 2, 3).onEach { delay(150) }
+val letters = flowOf("A", "B", "C").onEach { delay(150) }
+
+combine(nums, letters) { n, l -> "$n$l" }.collect(::println)
+// Output (timing-dependent):
+// 1A
+// 2A
+// 2B
+// 3B
+// 3C</code></pre>
+
+<h3>When to use it</h3>
+<p>This is the workhorse for reactive state. Anywhere you have multiple sources of state and want a derived result that updates whenever any source changes:</p>
+
+<pre><code>data class SearchUiState(
+    val query: String,
+    val filter: Filter,
+    val results: List&lt;Item&gt;
+)
+
+val uiState: Flow&lt;SearchUiState&gt; = combine(
+    queryFlow,
+    filterFlow,
+    resultsFlow
+) { query, filter, results ->
+    SearchUiState(query, filter, results)
+}</code></pre>
+
+<h3>Gotchas</h3>
+<ul>
+  <li><strong>Silent until all sources emit.</strong> If one of your input flows takes a long time to produce its first value (e.g. waits on a network call), the combined flow stays silent. Provide a sensible initial value with <code>onStart { emit(default) }</code> upstream, or use a <code>StateFlow</code> which always has one.</li>
+  <li><strong>Not synchronized.</strong> combine doesn't wait for all flows to emit something <em>new</em> — it emits as soon as any one of them does, even if the others' values haven't changed since the last emission. That's usually the point, but make sure your downstream is idempotent.</li>
+  <li><strong>Variants.</strong> <code>combine</code> has overloads for 2 to 5 flows. For more, pass a <code>vararg</code> of flows or a <code>List</code>. There's also <code>combineTransform</code>, which gives you a <code>FlowCollector</code> so you can emit zero or many times per change.</li>
+</ul>
+
+<hr>
+
+<h2>Merge — interleave into one stream</h2>
+<img src="https://raw.githubusercontent.com/henriquehorbovyi/blog/refs/heads/main/posts/kotlin-merge-combine-zip/merge.png" alt="Merge marble diagram" />
+
+<p><code>merge</code> collects from all input flows concurrently and re-emits values as they arrive, preserving original order <em>within</em> each flow but interleaving freely <em>between</em> them. There's no transformation lambda — same type in, same type out. The result completes when <strong>all</strong> input flows have completed.</p>
+
+<pre><code>val flow1 = flowOf(1, 2, 3).onEach { delay(100) }
+val flow2 = flowOf(10, 20, 30).onEach { delay(150) }
+
+merge(flow1, flow2).collect(::println)
+// Output (interleaved by arrival time):
+// 1, 10, 2, 3, 20, 30</code></pre>
+
+<h3>When to use it</h3>
+<p>You have multiple sources of the same kind of event and want all of them: clicks from different buttons, messages from different channels, pushes from multiple WebSockets.</p>
+
+<pre><code>val allUserActions: Flow&lt;UserAction&gt; = merge(
+    homeButton.clicks,
+    settingsButton.clicks,
+    backGesture.events
+)</code></pre>
+
+<h3>Gotchas</h3>
+<ul>
+  <li><strong>Order between flows is non-deterministic.</strong> Don't rely on flow1 winning a tie — it depends on the dispatcher and scheduling.</li>
+  <li><strong>Concurrent collection.</strong> Each input flow is collected on its own coroutine. If your producers do thread-confined work, be aware.</li>
+  <li><strong>For <code>Flow&lt;Flow&lt;T&gt;&gt;</code></strong>, look at <code>flattenMerge</code> (and its siblings <code>flattenConcat</code>, <code>flatMapMerge</code>, <code>flatMapConcat</code>, <code>flatMapLatest</code>).</li>
+</ul>
+
+<hr>
+
+<h2>A real-world example: reactive search</h2>
+
+<p>Here's a snippet that uses both <code>combine</code> and <code>merge</code> in the service of one feature — a search screen that re-queries an API based on the latest query and filter, <em>and</em> re-queries when the user taps a refresh button:</p>
+
+<pre><code>class SearchViewModel(
+    private val repository: SearchRepository
+) : ViewModel() {
+
+    private val queryFlow = MutableStateFlow("")
+    private val filterFlow = MutableStateFlow(Filter.All)
+    private val refreshClicks = MutableSharedFlow&lt;Unit&gt;()
+
+    private val searchTriggers: Flow&lt;Pair&lt;String, Filter&gt;&gt; =
+        combine(queryFlow, filterFlow) { q, f -> q to f }
+
+    val results: Flow&lt;List&lt;Item&gt;&gt; = merge(
+        searchTriggers,
+        refreshClicks.map { queryFlow.value to filterFlow.value }
+    )
+        .debounce(300)
+        .flatMapLatest { (q, f) -> repository.search(q, f) }
+}</code></pre>
+
+<p><code>zip</code> doesn't fit here because the query and filter are independent UI state, not paired sequences. It would, however, be the right call if you were fetching a list of user IDs and, in parallel, loading each one's avatar in matching order:</p>
+
+<pre><code>val users: Flow&lt;User&gt; = userIdFlow.map { repo.getUser(it) }
+val avatars: Flow&lt;Bitmap&gt; = userIdFlow.map { repo.getAvatar(it) }
+
+val cards: Flow&lt;UserCard&gt; = users.zip(avatars) { user, avatar ->
+    UserCard(user, avatar)
+}</code></pre>
+
+<p>Both flows are derived from the same indexed sequence, so pairing strictly 1-to-1 is exactly what you want.</p>
+
+<hr>
+
+<h2>TL;DR — three mental models</h2>
+<ul>
+  <li><strong><code>zip</code></strong> = a zipper. Matches teeth, drops extras.</li>
+  <li><strong><code>combine</code></strong> = a spreadsheet cell. Recalculates whenever any input changes.</li>
+  <li><strong><code>merge</code></strong> = a postal sorter. Many bins → one belt.</li>
+</ul>
+
+<p>If you keep those three pictures in your head, you'll always reach for the right one.</p>
+
+<h2>Further reading</h2>
+<ul>
+  <li><a href="https://kotlinlang.org/docs/flow.html" target="_blank" rel="noopener">Kotlin Flow documentation</a></li>
+  <li><a href="https://kotlinlang.org/api/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines.flow/" target="_blank" rel="noopener">kotlinx.coroutines Flow API reference</a></li>
+  <li>Related operators worth knowing: <code>combineTransform</code>, <code>flattenMerge</code>, <code>flatMapMerge</code>, <code>flatMapLatest</code>, <code>flatMapConcat</code></li>
+</ul>
